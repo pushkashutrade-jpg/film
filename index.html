@@ -403,6 +403,7 @@ const VALID_TYPES = ['Фильм','Сериал'];
 const VALID_STATUSES = ['wish','watching','paused','done'];
 const VALID_SECTIONS = ['overview','collection','library','stats'];
 const MAX_POSTER_DATA_LENGTH = 4 * 1024 * 1024;
+const MAX_BACKUP_FILE_SIZE = 100 * 1024 * 1024;
 const PLACEHOLDER = 'data:image/svg+xml,' + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="80" height="110" viewBox="0 0 80 110"><rect width="80" height="110" rx="10" fill="#242428"/><path d="M28 28h24v34H28z" fill="#ff7a00"/><circle cx="40" cy="45" r="8" fill="#242428"/><path d="M22 78h36M26 86h28" stroke="#8e8e93" stroke-width="4" stroke-linecap="round"/></svg>').replace(/'/g,'%27');
 
 // Tiny offline fallback: the app works even when optional animations are unavailable.
@@ -1305,7 +1306,7 @@ $('#exportBtn').addEventListener('click',()=>{
 });
 $('#importFile').addEventListener('change',e=>{
   const file=e.target.files[0];if(!file)return;
-  if(file.size>10*1024*1024){toast('Файл слишком большой (макс 10 МБ)');e.target.value='';return}
+  if(file.size>MAX_BACKUP_FILE_SIZE){toast('Файл слишком большой (макс 100 МБ)');e.target.value='';return}
   const r=new FileReader();
   r.onload=async ev=>{
     try{
