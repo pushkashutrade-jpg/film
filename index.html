@@ -397,6 +397,8 @@ body{display:flex;justify-content:center}
    ========================================================= */
 const STORAGE_KEY = 'kinodnevnik.v2';
 const OLD_KEYS = ['kinodnevnik','movies','collection','library','kinodnevnik.v1'];
+const POSTER_DB_NAME = 'kinodnevnik.posters';
+const POSTER_STORE_NAME = 'posters';
 const VALID_TYPES = ['Фильм','Сериал'];
 const VALID_STATUSES = ['wish','watching','paused','done'];
 const VALID_SECTIONS = ['overview','collection','library','stats'];
@@ -547,13 +549,104 @@ function normalize(d){
 }
 
 let DATA = migrate();
-function save(){
-  try{localStorage.setItem(STORAGE_KEY,JSON.stringify(DATA))}
+let posterDb=null;
+let posterCache=new Map();
+let posterSaveQueue=Promise.resolve();
+let posterStorageInitPromise=null;
+
+function posterKey(mode,item){return `${mode}:${item.id}`}
+function openPosterDatabase(){
+  return new Promise((resolve,reject)=>{
+    if(!window.indexedDB){reject(new Error('IndexedDB is unavailable'));return}
+    const request=indexedDB.open(POSTER_DB_NAME,1);
+    request.onupgradeneeded=()=>{
+      const db=request.result;
+      if(!db.objectStoreNames.contains(POSTER_STORE_NAME))db.createObjectStore(POSTER_STORE_NAME,{keyPath:'key'});
+    };
+    request.onsuccess=()=>resolve(request.result);
+    request.onerror=()=>reject(request.error||new Error('Could not open poster storage'));
+    request.onblocked=()=>reject(new Error('Poster storage upgrade is blocked'));
+  });
+}
+function readPosterRecords(db){
+  return new Promise((resolve,reject)=>{
+    const request=db.transaction(POSTER_STORE_NAME,'readonly').objectStore(POSTER_STORE_NAME).getAll();
+    request.onsuccess=()=>resolve(request.result||[]);
+    request.onerror=()=>reject(request.error||new Error('Could not read posters'));
+  });
+}
+function updatePosterRecords(snapshot){
+  const desired=new Map();
+  snapshot.collection.forEach(m=>{if(m.poster)desired.set(posterKey('collection',m),m.poster)});
+  snapshot.library.forEach(m=>{if(m.poster)desired.set(posterKey('library',m),m.poster)});
+  const puts=[...desired].filter(([key,data])=>posterCache.get(key)!==data);
+  const deletes=[...posterCache.keys()].filter(key=>!desired.has(key));
+  if(!puts.length&&!deletes.length)return Promise.resolve();
+  return new Promise((resolve,reject)=>{
+    const tx=posterDb.transaction(POSTER_STORE_NAME,'readwrite');
+    const store=tx.objectStore(POSTER_STORE_NAME);
+    puts.forEach(([key,data])=>store.put({key,data}));
+    deletes.forEach(key=>store.delete(key));
+    tx.oncomplete=()=>{
+      puts.forEach(([key,data])=>posterCache.set(key,data));
+      deletes.forEach(key=>posterCache.delete(key));
+      resolve();
+    };
+    tx.onerror=()=>reject(tx.error||new Error('Could not write posters'));
+    tx.onabort=()=>reject(tx.error||new Error('Poster write was aborted'));
+  });
+}
+function snapshotData(){
+  return {
+    ...DATA,
+    collection:DATA.collection.map(m=>({...m,poster:m.poster||''})),
+    library:DATA.library.map(m=>({...m,poster:m.poster||''}))
+  };
+}
+function withoutPosters(snapshot){
+  return {
+    ...snapshot,
+    collection:snapshot.collection.map(m=>({...m,poster:''})),
+    library:snapshot.library.map(m=>({...m,poster:''}))
+  };
+}
+async function persistSnapshot(snapshot){
+  if(posterDb){
+    try{
+      await updatePosterRecords(snapshot);
+      localStorage.setItem(STORAGE_KEY,JSON.stringify(withoutPosters(snapshot)));
+      return;
+    }catch(error){
+      posterDb.close();posterDb=null;posterCache.clear();
+      try{localStorage.setItem(STORAGE_KEY,JSON.stringify(snapshot));toast('Не удалось сохранить постеры отдельно; попробую сохранить их в памяти браузера')}
+      catch(e){
+        try{localStorage.setItem(STORAGE_KEY,JSON.stringify(withoutPosters(snapshot)));toast('Постеры не сохранились: освободите место в браузере или уменьшите их размер')}
+        catch(e2){toast('Не удалось сохранить данные')}
+      }
+      return;
+    }
+  }
+  try{localStorage.setItem(STORAGE_KEY,JSON.stringify(snapshot))}
   catch(e){
-    // Keep the live data intact if storage is full; persist a poster-free copy as fallback.
-    const compact={...DATA,collection:DATA.collection.map(m=>({...m,poster:''})),library:DATA.library.map(m=>({...m,poster:''}))};
-    try{localStorage.setItem(STORAGE_KEY,JSON.stringify(compact));toast('Место в хранилище закончилось: постеры не сохраняются')}
+    try{localStorage.setItem(STORAGE_KEY,JSON.stringify(withoutPosters(snapshot)));toast('Постеры не сохранились: разрешите хранилище сайта в браузере')}
     catch(e2){toast('Не удалось сохранить данные')}
+  }
+}
+function save(){
+  const init=posterStorageInitPromise||Promise.resolve();
+  posterSaveQueue=posterSaveQueue.then(()=>init).then(()=>persistSnapshot(snapshotData())).catch(()=>toast('Не удалось сохранить данные'));
+  return posterSaveQueue;
+}
+async function initializePosterStorage(){
+  try{
+    posterDb=await openPosterDatabase();
+    const records=await readPosterRecords(posterDb);
+    posterCache=new Map(records.map(record=>[record.key,record.data]));
+    for(const item of DATA.collection){if(!item.poster)item.poster=posterCache.get(posterKey('collection',item))||''}
+    for(const item of DATA.library){if(!item.poster)item.poster=posterCache.get(posterKey('library',item))||''}
+  }catch(error){
+    posterDb=null;
+    posterCache.clear();
   }
 }
 
@@ -1005,7 +1098,7 @@ $('#fFile').addEventListener('change',e=>{
   r.readAsDataURL(file);
 });
 
-$('#fSave').addEventListener('click',()=>{
+$('#fSave').addEventListener('click',async()=>{
   const title=$('#fTitle').value.trim();
   if(!title){toast('Введите название');return}
   const type=$('#fType').value;
@@ -1043,7 +1136,7 @@ $('#fSave').addEventListener('click',()=>{
       DATA.library.push({id:newId(),...base,status,createdAt:Date.now()});
     }
   }
-  save();closeForm();
+  await save();closeForm();
   setTimeout(()=>{
     if(type!==state.type)setType(type);
     render();toast('Сохранено');
@@ -1214,7 +1307,7 @@ $('#importFile').addEventListener('change',e=>{
   const file=e.target.files[0];if(!file)return;
   if(file.size>10*1024*1024){toast('Файл слишком большой (макс 10 МБ)');e.target.value='';return}
   const r=new FileReader();
-  r.onload=ev=>{
+  r.onload=async ev=>{
     try{
       const parsed=JSON.parse(ev.target.result);
       if(!parsed||typeof parsed!=='object'||Array.isArray(parsed)||!('collection'in parsed||'library'in parsed))throw new Error('bad');
@@ -1223,7 +1316,7 @@ $('#importFile').addEventListener('change',e=>{
       DATA=normalize(parsed);
       DATA.settings.currentSection=state.section;
       DATA.settings.currentType=state.type;
-      save();render();toast('Импортировано');
+      await save();render();toast('Импортировано');
       $('#backupOverlay').classList.remove('active');
     }catch(err){toast('Некорректный файл')}
   };
@@ -1249,9 +1342,6 @@ function render(){
 $('#typeInd').style.transform = state.type==='Сериал'?'translateX(100%)':'translateX(0)';
 $$('#typeSeg button').forEach(b=>b.classList.toggle('active',b.dataset.type===state.type));
 
-// section
-showSection(state.section);
-
 // add button
 $('#addBtn').addEventListener('click',()=>{
   const mode = state.section==='library'?'library':'collection';
@@ -1262,6 +1352,10 @@ $('#addBtn').addEventListener('click',()=>{
 
 // reduced motion
 if(reduceMotion){document.documentElement.style.setProperty('--anim','none')}
+
+// Load poster files from IndexedDB before the first save strips them from localStorage.
+posterStorageInitPromise=initializePosterStorage();
+posterStorageInitPromise.then(()=>showSection(state.section));
 </script>
 </body>
 </html>
